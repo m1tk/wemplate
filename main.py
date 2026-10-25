@@ -2,7 +2,7 @@ import tkinter as tk
 
 def main():
     root = tk.Tk()
-    root.title("Hello World GUI")
+    root.title("Hello World")
     root.geometry("300x200")
 
     label = tk.Label(root, text="Hello, World!", font=("Arial", 16))
