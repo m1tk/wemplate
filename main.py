@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
+r"""
 Word Print Server
 =================
 A tiny local print service for the "Word Template Filler" web app.
@@ -8,7 +8,12 @@ A tiny local print service for the "Word Template Filler" web app.
 What it does
 ------------
 * Runs a localhost-only HTTP server with a tkinter GUI
-  (host / port fields, printer dropdown, Start/Stop button, live log).
+  (host / port fields, printer dropdown, temp-folder override,
+  Start/Stop button, live log).
+* Uploaded .docx files are buffered into a per-job temp folder. By default
+  that is the Windows temp dir (%TEMP%); if that folder is not writable on
+  your machine ("cannot buffer upload: permission denied"), set a custom
+  "Temp folder" in the GUI (e.g. C:\Temp) and start the server again.
 * POST /print : body = raw .docx bytes
                 headers: X-Filename (URI-encoded, Arabic OK), X-Copies (int)
 * GET  /ping  : status JSON the web app uses for its "Connect" check
@@ -64,7 +69,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME              = "Word Print Server"
 SERVICE_ID            = "word-print-server"
-VERSION               = "1.0.0"
+VERSION               = "1.1.0"
 DOCX_MIME             = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DEFAULT_HOST          = "127.0.0.1"
 DEFAULT_PORT          = 9100
@@ -101,6 +106,7 @@ STATE = {
     "server_thread": None,   # serve_forever thread
     "worker": None,          # WordWorker instance
     "printer": DEFAULT_PRINTER_LABEL,
+    "temp_dir": "",          # "" = Windows default (%TEMP%); set in the GUI
     "jobs_total": 0,
     "boot_t": time.time(),
     "started_at": None,
@@ -131,14 +137,29 @@ def drain_log_to_console() -> None:
             level, line = LOGQ.get_nowait()
         except queue.Empty:
             return
-        stream = sys.stderr if level in ("error", "warn") else sys.stdout
-        print(line, file=stream)
+        _console(line, error=level in ("error", "warn"))
 
 
 def _first_line(text: str, limit: int = 300) -> str:
     text = (text or "").strip().replace("\r", "")
     line = text.splitlines()[0] if text else ""
     return line[:limit] if line else "unknown error"
+
+
+def _console(msg: str, error: bool = False) -> None:
+    """
+    Console output that never crashes in headless / frozen contexts:
+    PyInstaller --windowed EXEs have sys.stdout / sys.stderr set to None.
+    """
+    order = ("stderr", "stdout") if error else ("stdout", "stderr")
+    for name in order:
+        stream = getattr(sys, name, None)
+        if stream is not None:
+            try:
+                print(msg, file=stream)
+            except Exception:
+                pass
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +186,39 @@ def get_default_printer():
         return _w32p.GetDefaultPrinter()
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Temp-folder handling (uploaded .docx files are buffered here before printing)
+# ---------------------------------------------------------------------------
+
+def get_temp_base() -> str:
+    """
+    Base folder that receives one 'wps_<job>_' sub-folder per print job.
+    A custom folder configured in the GUI (STATE["temp_dir"]) takes
+    precedence; an empty value means the Windows default (%TEMP%).
+    """
+    custom = (STATE.get("temp_dir") or "").strip()
+    return custom if custom else tempfile.gettempdir()
+
+
+def probe_temp_dir(path: str):
+    """
+    Check that *path* can host job temp folders: it is created when missing
+    and must accept writing + deleting a probe file.
+    Returns (ok, message): on success message is the normalized absolute
+    path; on failure it is "<path>: <reason>".
+    """
+    try:
+        path = os.path.abspath(os.path.expanduser(path.strip()))
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f"wps_probe_{uuid.uuid4().hex[:8]}.tmp")
+        with open(probe, "wb") as fh:
+            fh.write(b"probe")
+        os.remove(probe)
+        return True, path
+    except OSError as exc:
+        return False, f"{path}: {_first_line(str(exc))}"
 
 
 # ---------------------------------------------------------------------------
@@ -501,15 +555,23 @@ class PrintHandler(BaseHTTPRequestHandler):
             return
 
         job_id = uuid.uuid4().hex[:8]
-        tmpdir = tempfile.mkdtemp(prefix=f"wps_{job_id}_")
-        path = os.path.join(tmpdir, f"job_{job_id}.docx")
+        temp_base = get_temp_base()
         try:
+            tmpdir = tempfile.mkdtemp(prefix=f"wps_{job_id}_", dir=temp_base)
+            path = os.path.join(tmpdir, f"job_{job_id}.docx")
             with open(path, "wb") as fh:
                 fh.write(body)
         except OSError as exc:
-            self._send_json({"ok": False,
-                             "error": f"cannot buffer upload: {_first_line(str(exc))}"},
-                            500)
+            detail = _first_line(str(exc))
+            log(f"JOB {job_id} ✗ cannot buffer upload into temp folder \""
+                f"{temp_base}\": {detail}", "error")
+            self._send_json({
+                "ok": False,
+                "error": (f"cannot buffer upload into temp folder "
+                          f"\"{temp_base}\" — {detail}. Fix: in the "
+                          f"{APP_NAME} window set a writable folder under "
+                          f"'Temp folder' (e.g. C:\\Temp), then Start again."),
+            }, 500, close=True)
             return
 
         printer_sel = STATE.get("printer") or DEFAULT_PRINTER_LABEL
@@ -580,6 +642,8 @@ class PrintHandler(BaseHTTPRequestHandler):
                                  else (default or DEFAULT_PRINTER_LABEL)),
             "default_printer": default,
             "printers": list_printers(),
+            "temp_dir": get_temp_base(),
+            "temp_dir_custom": bool((STATE.get("temp_dir") or "").strip()),
             "jobs_total": STATE.get("jobs_total", 0),
             "uptime_s": int(time.time() - STATE["boot_t"]),
             "localhost_only": True,
@@ -686,11 +750,11 @@ def cleanup() -> None:
     try:
         stop_server()
     except Exception as exc:                   # pragma: no cover
-        print(f"[cleanup] stop_server: {exc}", file=sys.stderr)
+        _console(f"[cleanup] stop_server: {exc}", error=True)
     try:
         stop_worker()
     except Exception as exc:                   # pragma: no cover
-        print(f"[cleanup] stop_worker: {exc}", file=sys.stderr)
+        _console(f"[cleanup] stop_worker: {exc}", error=True)
 
 
 atexit.register(cleanup)
@@ -700,10 +764,15 @@ atexit.register(cleanup)
 # ---------------------------------------------------------------------------
 
 def _config_path() -> str:
-    try:
-        base = os.path.dirname(os.path.abspath(__file__))
-    except NameError:                          # pragma: no cover
-        base = os.getcwd()
+    if getattr(sys, "frozen", False):
+        # Frozen (PyInstaller) exe: __file__ lives in a throwaway extraction
+        # folder — keep the settings file next to the real .exe instead.
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except NameError:                      # pragma: no cover
+            base = os.getcwd()
     return os.path.join(base, CONFIG_FILE_NAME)
 
 
@@ -716,16 +785,20 @@ def load_config() -> dict:
             cfg["host"] = parser.get("server", "host", fallback="").strip()
             cfg["port"] = parser.get("server", "port", fallback="").strip()
             cfg["printer"] = parser.get("printer", "name", fallback="").strip()
+            cfg["temp_dir"] = parser.get("server", "temp_dir",
+                                         fallback="").strip()
     except Exception:
         pass
     return cfg
 
 
-def save_config(host: str, port: str, printer: str) -> None:
+def save_config(host: str, port: str, printer: str,
+                temp_dir: str = "") -> None:
     try:
         import configparser
         parser = configparser.ConfigParser()
-        parser["server"] = {"host": host, "port": port}
+        parser["server"] = {"host": host, "port": port,
+                            "temp_dir": temp_dir}
         parser["printer"] = {"name": printer}
         with open(_config_path(), "w", encoding="utf-8") as fh:
             parser.write(fh)
@@ -738,20 +811,24 @@ def save_config(host: str, port: str, printer: str) -> None:
 # ---------------------------------------------------------------------------
 
 class App:
-    """tkinter front-end: host/port, printer dropdown, start/stop, log."""
+    """tkinter front-end: host/port, printer dropdown, temp folder,
+    start/stop, log."""
 
     def __init__(self, root: "tk.Tk"):
         self.root = root
         self.running = False
         self._nlines = 0
-        self._last_host, self._last_port = DEFAULT_HOST, str(DEFAULT_PORT)
 
         cfg = load_config()
+        # "last started" values — also the fallback persisted on close, so
+        # settings survive even if the user closes without pressing Start.
+        self._last_host = cfg.get("host") or DEFAULT_HOST
+        self._last_port = cfg.get("port") or str(DEFAULT_PORT)
+        self._last_temp = cfg.get("temp_dir") or ""
 
-        self.host_var = tk.StringVar(
-            value=cfg.get("host") or DEFAULT_HOST)
-        self.port_var = tk.StringVar(
-            value=cfg.get("port") or str(DEFAULT_PORT))
+        self.host_var = tk.StringVar(value=self._last_host)
+        self.port_var = tk.StringVar(value=self._last_port)
+        self.temp_var = tk.StringVar(value=self._last_temp)
         self.printer_var = tk.StringVar(value=DEFAULT_PRINTER_LABEL)
 
         root.title(f"{APP_NAME}  v{VERSION}")
@@ -794,6 +871,24 @@ class App:
         self.printer_cb.bind("<<ComboboxSelected>>", self.on_printer_change)
         ttk.Button(row1, text="↻ Refresh printers",
                    command=self.refresh_printers).pack(side="left")
+
+        # -- temp folder row: where uploads are buffered before printing. -----
+        # The Windows default (%TEMP%) is not writable on some machines —
+        # point this at any writable folder (e.g. C:\Temp) to fix
+        # "cannot buffer upload: permission denied".
+        row_t = ttk.Frame(top); row_t.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(row_t, text="Temp folder:").pack(side="left")
+        self.temp_entry = ttk.Entry(row_t, textvariable=self.temp_var)
+        self.temp_entry.pack(side="left", fill="x", expand=True, padx=(2, 6))
+        self.temp_browse_btn = ttk.Button(row_t, text="Browse…", width=10,
+                                          command=self.browse_temp)
+        self.temp_browse_btn.pack(side="left")
+        self.temp_reset_btn = ttk.Button(row_t, text="Use Windows default",
+                                         width=18, command=self.reset_temp)
+        self.temp_reset_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(row_t, foreground="#888",
+                  text="empty = Windows default (%TEMP%)").pack(
+            side="left", padx=(6, 0))
 
         row2 = ttk.Frame(top); row2.pack(fill="x", padx=6, pady=(0, 6))
         self.start_btn = ttk.Button(row2, text="▶ Start server",
@@ -876,6 +971,20 @@ class App:
         except OSError as exc:
             log(f"Cannot save log: {_first_line(str(exc))}", "error")
 
+    # ---------------------------- temp folder --------------------------------
+
+    def browse_temp(self) -> None:
+        """Pick a folder for print-job temp files (upload buffering)."""
+        chosen = filedialog.askdirectory(
+            title="Choose a writable folder for print-job temporary files",
+            initialdir=self.temp_var.get().strip() or tempfile.gettempdir())
+        if chosen:
+            self.temp_var.set(os.path.normpath(chosen))
+
+    def reset_temp(self) -> None:
+        """Back to the Windows default temp folder (%TEMP%)."""
+        self.temp_var.set("")
+
     # ------------------------------ actions ---------------------------------
 
     def refresh_printers(self, quiet: bool = False) -> None:
@@ -898,7 +1007,8 @@ class App:
         STATE["printer"] = self.printer_var.get() or DEFAULT_PRINTER_LABEL
         log(f"Printer for new jobs: {STATE['printer']}")
         if self.running:
-            save_config(self._last_host, self._last_port, STATE["printer"])
+            save_config(self._last_host, self._last_port, STATE["printer"],
+                        self._last_temp)
 
     def on_toggle(self) -> None:
         if self.running:
@@ -915,12 +1025,30 @@ class App:
         except ValueError:
             log("Port must be an integer between 1 and 65535.", "error")
             return
+
+        # -- temp folder: verify BEFORE binding, so a bad folder never
+        #    produces "cannot buffer upload: permission denied" mid-printing
+        temp_custom = self.temp_var.get().strip()
+        if temp_custom:
+            ok, msg = probe_temp_dir(temp_custom)
+            if not ok:
+                log(f"Temp folder is not usable — {msg}", "error")
+                log("Fix the path (or press 'Use Windows default') and "
+                    "Start again.", "error")
+                return
+            STATE["temp_dir"] = msg                      # normalized path
+            log(f"Temp folder: {msg}  (verified writable)", "ok")
+        else:
+            STATE["temp_dir"] = ""
+            log(f"Temp folder: Windows default ({tempfile.gettempdir()})")
+
         STATE["printer"] = self.printer_var.get() or DEFAULT_PRINTER_LABEL
         if start_server(host, port) is None:
             self._set_running(False)
             return
         self._last_host, self._last_port = host, str(port)
-        save_config(host, str(port), STATE["printer"])
+        self._last_temp = STATE["temp_dir"]
+        save_config(host, str(port), STATE["printer"], STATE["temp_dir"])
         self._set_running(True)
         extra = ""
         if PYWIN32:
@@ -950,6 +1078,9 @@ class App:
         state = "disabled" if running else "normal"
         self.host_entry.configure(state=state)
         self.port_entry.configure(state=state)
+        self.temp_entry.configure(state=state)
+        self.temp_browse_btn.configure(state=state)
+        self.temp_reset_btn.configure(state=state)
 
     def on_close(self) -> None:
         try:
@@ -958,7 +1089,8 @@ class App:
                 return
         except Exception:
             pass
-        save_config(self._last_host, self._last_port, STATE["printer"])
+        save_config(self._last_host, self._last_port, STATE["printer"],
+                    self._last_temp)
         self.root.destroy()      # cleanup() runs via atexit / after mainloop
 
 
@@ -1049,9 +1181,10 @@ def run_selftest() -> int:
           isinstance(payload.get("print_ms"), int) and
           payload.get("wait_ms") is not None,
           extra=json.dumps(payload, ensure_ascii=False)[:200])
-    check("temp job file cleaned up",
-          not [d for d in tempfile.gettempdir()
-               if d.startswith("wps_") ] and True)
+    job_dir_re = re.compile(r"^wps_[0-9a-f]{8}_.")   # per-job dirs only
+    check("temp job folders cleaned up",
+          not [n for n in os.listdir(get_temp_base())
+               if job_dir_re.match(n)])
 
     # 4. copies clamp
     r, data = request("POST", "/print", port=port,
@@ -1108,6 +1241,37 @@ def run_selftest() -> int:
     else:
         print("  SKIP  non-local client rejected (no non-loopback interface)")
 
+    # 12. custom temp folder (the GUI "Temp folder" setting, server-side)
+    custom_dir = tempfile.mkdtemp(prefix="wps_custom_probe_")
+    STATE["temp_dir"] = custom_dir
+    ok, msg = probe_temp_dir(custom_dir)
+    check("probe_temp_dir accepts a writable folder",
+          ok and msg == os.path.abspath(custom_dir), extra=msg)
+    port3 = _free_port()
+    if start_server("127.0.0.1", port3):
+        r, data = request("POST", "/print", port=port3,
+                          headers={"X-Filename": "custom.docx"},
+                          body=fake_docx)
+        check("print job buffered in the custom temp folder",
+              r.status == 200 and json.loads(data).get("ok"))
+        r, data = request("GET", "/ping", port=port3)
+        check("ping reports the effective temp folder",
+              json.loads(data).get("temp_dir") == os.path.abspath(custom_dir))
+        check("custom temp folder cleaned after the job",
+              not os.listdir(custom_dir))
+        stop_server()
+    STATE["temp_dir"] = ""
+    shutil.rmtree(custom_dir, ignore_errors=True)
+
+    # 13. probe rejects an unusable folder (target path is inside a file)
+    blocker_dir = tempfile.mkdtemp(prefix="wps_probe_reject_")
+    blocker = os.path.join(blocker_dir, "file.txt")
+    with open(blocker, "w", encoding="utf-8") as fh:
+        fh.write("not a folder")
+    ok, msg = probe_temp_dir(os.path.join(blocker, "sub"))
+    check("probe_temp_dir rejects an unusable folder", not ok, extra=msg)
+    shutil.rmtree(blocker_dir, ignore_errors=True)
+
     stop_server()
     stop_worker()
     cleanup()
@@ -1129,9 +1293,9 @@ def main(argv=None) -> int:
     if "--selftest" in argv:
         return run_selftest()
     if not TK_OK:
-        print("tkinter is not available in this Python installation; "
-              "cannot open the GUI.", file=sys.stderr)
-        print("Try:  python word_print_server.py --selftest", file=sys.stderr)
+        _console("tkinter is not available in this Python installation; "
+                 "cannot open the GUI.", error=True)
+        _console("Try:  python word_print_server.py --selftest", error=True)
         return 2
     root = tk.Tk()
     app = App(root)
