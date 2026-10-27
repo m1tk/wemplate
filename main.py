@@ -10,10 +10,14 @@ What it does
 * Runs a localhost-only HTTP server with a tkinter GUI
   (host / port fields, printer dropdown, temp-folder override,
   Start/Stop button, live log).
-* Uploaded .docx files are buffered into a per-job temp folder. By default
-  that is the Windows temp dir (%TEMP%); if that folder is not writable on
-  your machine ("cannot buffer upload: permission denied"), set a custom
-  "Temp folder" in the GUI (e.g. C:\Temp) and start the server again.
+* Uploaded .docx files are buffered into a per-job temp folder. The GUI
+  "Temp folder" field chooses where: the folder you set, else the Windows
+  default (%TEMP%), else a 'print_jobs' folder next to this program —
+  whatever is actually writable. Each candidate is probed at Start by
+  writing a REAL .docx inside a sub-folder (exactly what a job does).
+  Note: "you can write there but this program can't" means per-application
+  blocking — Windows Defender 'Controlled folder access' or antivirus
+  ransomware protection. Allow this program (wemplate.exe) in it.
 * POST /print : body = raw .docx bytes
                 headers: X-Filename (URI-encoded, Arabic OK), X-Copies (int)
 * GET  /ping  : status JSON the web app uses for its "Connect" check
@@ -49,6 +53,7 @@ Dependencies: pywin32 on Windows  ->  pip install pywin32
 from __future__ import annotations
 
 import atexit
+import getpass
 import json
 import os
 import queue
@@ -69,7 +74,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME              = "Word Print Server"
 SERVICE_ID            = "word-print-server"
-VERSION               = "1.1.0"
+VERSION               = "1.2.0"
 DOCX_MIME             = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DEFAULT_HOST          = "127.0.0.1"
 DEFAULT_PORT          = 9100
@@ -202,23 +207,87 @@ def get_temp_base() -> str:
     return custom if custom else tempfile.gettempdir()
 
 
+def _normalize_dir(path: str) -> str:
+    """
+    Clean a user-typed folder path into an absolute path: trims spaces and
+    the surrounding quotes Windows Explorer's "Copy as path" adds, expands
+    %VARS% and ~.
+    """
+    return os.path.abspath(
+        os.path.expandvars(
+            os.path.expanduser((path or "").strip().strip('"'))))
+
+
 def probe_temp_dir(path: str):
     """
-    Check that *path* can host job temp folders: it is created when missing
-    and must accept writing + deleting a probe file.
+    Check that *path* can host job temp folders by doing EXACTLY what a
+    print job does: create a 'wps_probe_…' sub-folder, write a .docx file
+    into it, delete both. (A plain .tmp probe would miss antivirus rules
+    that block office documents specifically.) The folder is created when
+    missing.
     Returns (ok, message): on success message is the normalized absolute
     path; on failure it is "<path>: <reason>".
     """
     try:
-        path = os.path.abspath(os.path.expanduser(path.strip()))
+        path = _normalize_dir(path)
         os.makedirs(path, exist_ok=True)
-        probe = os.path.join(path, f"wps_probe_{uuid.uuid4().hex[:8]}.tmp")
-        with open(probe, "wb") as fh:
-            fh.write(b"probe")
-        os.remove(probe)
+        sub = tempfile.mkdtemp(prefix="wps_probe_", dir=path)
+        try:
+            docx = os.path.join(sub, f"probe_{uuid.uuid4().hex[:8]}.docx")
+            with open(docx, "wb") as fh:
+                fh.write(b"PK\x03\x04" + b"\x00" * 64)
+        finally:
+            shutil.rmtree(sub, ignore_errors=True)
         return True, path
     except OSError as exc:
-        return False, f"{path}: {_first_line(str(exc))}"
+        detail = _first_line(str(exc))
+        winerr = getattr(exc, "winerror", None)
+        if winerr is not None:
+            detail = f"{detail} (winerror {winerr})"
+        return False, f"{path}: {detail}"
+
+
+def _current_user() -> str:
+    """Best-effort process user name — helps diagnose permission issues."""
+    try:
+        return getpass.getuser()
+    except Exception:                          # pragma: no cover
+        return ""
+
+
+def pick_temp_base(custom: str = ""):
+    """
+    Decide where print-job temp folders go — first candidate that is
+    actually WRITABLE wins:
+      1. the folder typed in the GUI ("Temp folder"), if any
+      2. the Windows default temp dir (%TEMP%)
+      3. a 'print_jobs' folder next to the program (script or .exe)
+    Returns (chosen, tried):
+      chosen = (label, verified_path) or None when nothing is writable
+      tried  = [(label, path, ok, message), ...] for the log
+    """
+    candidates = []
+    if (custom or "").strip():
+        candidates.append(("Temp folder set in the GUI",
+                           _normalize_dir(custom)))
+    candidates.append(("Windows default temp (%TEMP%)",
+                       tempfile.gettempdir()))
+    try:
+        if getattr(sys, "frozen", False):
+            prog_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            prog_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:                          # pragma: no cover
+        prog_dir = os.getcwd()
+    candidates.append(("'print_jobs' next to the program",
+                       os.path.join(prog_dir, "print_jobs")))
+    tried = []
+    for label, path in candidates:
+        ok, msg = probe_temp_dir(path)
+        tried.append((label, path, ok, msg))
+        if ok:
+            return (label, msg), tried
+    return None, tried
 
 
 # ---------------------------------------------------------------------------
@@ -563,14 +632,23 @@ class PrintHandler(BaseHTTPRequestHandler):
                 fh.write(body)
         except OSError as exc:
             detail = _first_line(str(exc))
+            winerr = getattr(exc, "winerror", None)
+            if winerr is not None:
+                detail = f"{detail} (winerror {winerr})"
             log(f"JOB {job_id} ✗ cannot buffer upload into temp folder \""
                 f"{temp_base}\": {detail}", "error")
+            log("Folder passed the Start probe, so something is blocking "
+                "THIS program specifically — Windows Defender 'Controlled "
+                "folder access' / antivirus ransomware protection. Allow "
+                "wemplate.exe in it, or choose another folder.", "warn")
             self._send_json({
                 "ok": False,
                 "error": (f"cannot buffer upload into temp folder "
-                          f"\"{temp_base}\" — {detail}. Fix: in the "
-                          f"{APP_NAME} window set a writable folder under "
-                          f"'Temp folder' (e.g. C:\\Temp), then Start again."),
+                          f"\"{temp_base}\" — {detail}. Fix: allow this "
+                          f"program in Windows Defender 'Controlled folder "
+                          f"access' / antivirus ransomware protection, or "
+                          f"set another 'Temp folder' in the {APP_NAME} "
+                          f"window, then Start again."),
             }, 500, close=True)
             return
 
@@ -760,7 +838,7 @@ def cleanup() -> None:
 atexit.register(cleanup)
 
 # ---------------------------------------------------------------------------
-# Config persistence (remembers host / port / printer between runs)
+# Config persistence (remembers host / port / printer / temp folder)
 # ---------------------------------------------------------------------------
 
 def _config_path() -> str:
@@ -1026,29 +1104,47 @@ class App:
             log("Port must be an integer between 1 and 65535.", "error")
             return
 
-        # -- temp folder: verify BEFORE binding, so a bad folder never
-        #    produces "cannot buffer upload: permission denied" mid-printing
+        # -- temp folder: pick a WRITABLE location BEFORE binding, so a bad
+        #    folder never produces "cannot buffer upload" mid-printing.
+        #    Order: GUI setting -> Windows default -> beside the program.
         temp_custom = self.temp_var.get().strip()
-        if temp_custom:
-            ok, msg = probe_temp_dir(temp_custom)
-            if not ok:
-                log(f"Temp folder is not usable — {msg}", "error")
-                log("Fix the path (or press 'Use Windows default') and "
-                    "Start again.", "error")
-                return
-            STATE["temp_dir"] = msg                      # normalized path
-            log(f"Temp folder: {msg}  (verified writable)", "ok")
+        chosen, tried = pick_temp_base(temp_custom)
+        if chosen is None:
+            for label, path, ok, msg in tried:
+                log(f"Temp folder NOT usable — {label} ({path}): {msg}",
+                    "error")
+            log("No writable temp folder found. This machine lets YOU write "
+                "but blocks THIS program from writing documents — that is "
+                "per-application protection: Windows Defender 'Controlled "
+                "folder access' or your antivirus' ransomware shield. Add "
+                "this program (wemplate.exe) to its allowed apps, then "
+                "Start again.", "error")
+            return
+        if temp_custom and chosen[1] != _normalize_dir(temp_custom):
+            fail_msg = next((msg for _l, _p, ok, msg in tried if not ok), "")
+            log(f"Your Temp folder is NOT writable for this program — "
+                f"{fail_msg}", "error")
+            log("YOU can write there, but THIS program can't — per-app "
+                "blocking (Windows Defender 'Controlled folder access' / "
+                "antivirus ransomware protection). Allow wemplate.exe in "
+                "it, or pick a folder outside Documents/Desktop.", "warn")
+            log(f"Falling back to: {chosen[0]} -> {chosen[1]}", "warn")
         else:
-            STATE["temp_dir"] = ""
-            log(f"Temp folder: Windows default ({tempfile.gettempdir()})")
+            for label, path, ok, msg in tried:
+                if ok:
+                    log(f"Temp folder candidate: {label} -> {path}", "debug")
+        user = _current_user()
+        STATE["temp_dir"] = chosen[1]        # effective folder for jobs
+        self._last_temp = temp_custom        # keep what the user typed
+        log(f"Temp folder: {chosen[1]}  (verified writable"
+            + (f"; program runs as '{user}'" if user else "") + ")", "ok")
 
         STATE["printer"] = self.printer_var.get() or DEFAULT_PRINTER_LABEL
         if start_server(host, port) is None:
             self._set_running(False)
             return
         self._last_host, self._last_port = host, str(port)
-        self._last_temp = STATE["temp_dir"]
-        save_config(host, str(port), STATE["printer"], STATE["temp_dir"])
+        save_config(host, str(port), STATE["printer"], temp_custom)
         self._set_running(True)
         extra = ""
         if PYWIN32:
@@ -1270,6 +1366,11 @@ def run_selftest() -> int:
         fh.write("not a folder")
     ok, msg = probe_temp_dir(os.path.join(blocker, "sub"))
     check("probe_temp_dir rejects an unusable folder", not ok, extra=msg)
+    chosen, _tried = pick_temp_base(os.path.join(blocker, "sub"))
+    check("temp base auto-falls-back when the custom folder is unusable",
+          chosen is not None and
+          chosen[0] != "Temp folder set in the GUI",
+          extra=str(chosen))
     shutil.rmtree(blocker_dir, ignore_errors=True)
 
     stop_server()
